@@ -34,13 +34,19 @@ contract Bridge is EssentialContract, IBridge {
         FAILED
     }
 
+    struct MessageState {
+        uint64 receivedAt;
+    }
+
     uint256 internal constant PLACEHOLDER = type(uint256).max;
 
     uint128 public nextMessageId; // slot 1
     mapping(bytes32 msgHash => bool recalled) public isMessageRecalled;
     mapping(bytes32 msgHash => Status) public messageStatus; // slot 3
-    Context private _ctx; // // slot 4,5,6pnpm
-    uint256[44] private __gap;
+    Context private _ctx; // slot 4,5,6
+    mapping(bytes32 msgHash => MessageState) public messageState; // slot 7
+    bool public allMessageExecutionPaused; // slot 8
+    uint256[42] private __gap;
 
     event SignalSent(address indexed sender, bytes32 msgHash);
     event MessageSent(bytes32 indexed msgHash, Message message);
@@ -60,6 +66,7 @@ contract Bridge is EssentialContract, IBridge {
     error B_PERMISSION_DENIED();
     error B_RECALLED_ALREADY();
     error B_STATUS_MISMATCH();
+    error B_TOO_EARLY();
 
     modifier sameChain(uint64 chainId) {
         if (chainId != block.chainid) revert B_INVALID_CHAINID();
@@ -129,6 +136,7 @@ contract Bridge is EssentialContract, IBridge {
         nonReentrant
         whenNotPaused
         sameChain(message.srcChainId)
+        returns (bool)
     {
         bytes32 msgHash = hashMessage(message);
         if (isMessageRecalled[msgHash]) revert B_RECALLED_ALREADY();
@@ -142,31 +150,27 @@ contract Bridge is EssentialContract, IBridge {
         );
         if (!received) revert B_NOT_FAILED();
 
-        isMessageRecalled[msgHash] = true;
-
-        // Execute the recall logic based on the contract's support for the
-        // IRecallableSender interface
-        bool support = message.from.supportsInterface(type(IRecallableSender).interfaceId);
-        if (support) {
-            _ctx =
-                Context({ msgHash: msgHash, from: address(this), srcChainId: message.srcChainId });
-
-            // Perform recall
-            IRecallableSender(message.from).onMessageRecalled{ value: message.value }(
-                message, msgHash
-            );
-
-            // Reset the context after the message call
-            _ctx = Context({
-                msgHash: bytes32(PLACEHOLDER),
-                from: address(uint160(PLACEHOLDER)),
-                srcChainId: uint64(PLACEHOLDER)
-            });
-        } else {
-            message.owner.sendEther(message.value);
+        uint64 delay = getMessageExecutionDelay();
+        if (delay == 0) {
+            _recallMessage(msgHash, message);
+            return true;
         }
 
-        emit MessageRecalled(msgHash);
+        MessageState storage msgState = messageState[msgHash];
+        if (msgState.receivedAt == 0) {
+            msgState.receivedAt = uint64(block.timestamp);
+
+            // emit an event
+
+            return false;
+        }
+
+        if (block.timestamp > msgState.receivedAt + delay) {
+            _recallMessage(msgHash, message);
+            return true;
+        }
+
+        revert B_TOO_EARLY();
     }
 
     /// @notice Processes a bridge message on the destination chain. This
@@ -338,6 +342,10 @@ contract Bridge is EssentialContract, IBridge {
         );
     }
 
+    function getMessageExecutionDelay() public view virtual returns (uint64) {
+        return 0;
+    }
+
     /// @notice Checks if the destination chain is enabled.
     /// @param chainId The destination chain ID.
     /// @return enabled True if the destination chain is enabled.
@@ -417,6 +425,36 @@ contract Bridge is EssentialContract, IBridge {
         if (status == Status.FAILED) {
             signalService.sendSignal(_signalForFailedMessage(msgHash));
         }
+    }
+
+    function _recallMessage(bytes32 msgHash, Message calldata message) private {
+        delete messageState[msgHash];
+
+        isMessageRecalled[msgHash] = true;
+
+        // Execute the recall logic based on the contract's support for the
+        // IRecallableSender interface
+        bool support = message.from.supportsInterface(type(IRecallableSender).interfaceId);
+        if (support) {
+            _ctx =
+                Context({ msgHash: msgHash, from: address(this), srcChainId: message.srcChainId });
+
+            // Perform recall
+            IRecallableSender(message.from).onMessageRecalled{ value: message.value }(
+                message, msgHash
+            );
+
+            // Reset the context after the message call
+            _ctx = Context({
+                msgHash: bytes32(PLACEHOLDER),
+                from: address(uint160(PLACEHOLDER)),
+                srcChainId: uint64(PLACEHOLDER)
+            });
+        } else {
+            message.owner.sendEther(message.value);
+        }
+
+        emit MessageRecalled(msgHash);
     }
 
     /// @notice Checks if the signal was received.
